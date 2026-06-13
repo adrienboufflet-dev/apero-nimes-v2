@@ -4,6 +4,8 @@ import random
 import tkinter as tk
 from tkinter import messagebox
 import customtkinter as ctk
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # ---- Appearance and Theme Settings ----
 ctk.set_appearance_mode("dark")
@@ -107,7 +109,6 @@ class LoginWindow(ctk.CTk):
             self.authenticated = True
             self.destroy()
         else:
-            # Check the database if a member profile has contributor permissions enabled
             try:
                 conn = get_db_connection()
                 cursor = conn.cursor()
@@ -120,8 +121,8 @@ class LoginWindow(ctk.CTk):
                     self.authenticated = True
                     self.destroy()
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Login Check Error: {e}")
                 
             messagebox.showerror("Access Denied", "Invalid or unauthorized keyphrase.")
 
@@ -132,7 +133,7 @@ class TrackerDashboard(ctk.CTk):
     def __init__(self, role):
         super().__init__()
         self.role = role
-        self.title(f"APERO GROTTE NIMES v4.2 - [{self.role} Mode]")
+        self.title(f"APERO GROTTE NIMES v4.5 - [{self.role} Mode]")
         self.geometry("1100x700")
         
         # Access Boolean Calculations
@@ -156,9 +157,33 @@ class TrackerDashboard(ctk.CTk):
         self.right_frame = ctk.CTkFrame(self.main_container)
         self.right_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
         
-        # Layout Sub-components Construction
+        # Set up Left Action Panel
         self.setup_left_panel()
-        self.setup_right_panel()
+
+        # Set up Right Tabbed View
+        self.tab_view = ctk.CTkTabview(self.right_frame)
+        self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.tab_view.add("👥 Group Roster")
+        self.tab_view.add("📜 History Logs")
+        self.tab_view.add("📊 Tricount Balance Sheets")
+        self.tab_view.add("📈 Trends")
+        
+        # Bind the tab change event to dynamically load the graph
+        self.tab_view.configure(command=self.on_tab_change)
+        
+        self.scroll_roster = ctk.CTkScrollableFrame(self.tab_view.tab("👥 Group Roster"))
+        self.scroll_roster.pack(fill="both", expand=True)
+        
+        self.scroll_history = ctk.CTkScrollableFrame(self.tab_view.tab("📜 History Logs"))
+        self.scroll_history.pack(fill="both", expand=True)
+        
+        self.txt_tricount = ctk.CTkTextbox(self.tab_view.tab("📊 Tricount Balance Sheets"), font=("Courier New", 12))
+        self.txt_tricount.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.graph_frame = ctk.CTkFrame(self.tab_view.tab("📈 Trends"))
+        self.graph_frame.pack(fill="both", expand=True)
+
         self.refresh_all_data()
 
     def setup_left_panel(self):
@@ -208,25 +233,171 @@ class TrackerDashboard(ctk.CTk):
         self.combo_exp_payer.pack(fill="x", padx=15, pady=3)
         ctk.CTkButton(self.f_exp, text="Log Spent Expense", command=self.log_expense_action).pack(fill="x", padx=15, pady=10)
 
-    def setup_right_panel(self):
-        # 1. Roster and Logs Tab Controls
-        self.tab_view = ctk.CTkTabview(self.right_frame)
-        self.tab_view.pack(fill="both", expand=True, padx=10, pady=10)
+    # ---- Actions Mechanics Callbacks ----
+    def add_user_action(self):
+        name = self.ent_new_user.get().strip()
+        if not name or name.upper() == "[WALLET]": return
+        conn = get_db_connection()
+        cursor = conn.cursor()
         
-        self.tab_view.add("👥 Group Roster")
-        self.tab_view.add("📜 History Logs")
-        self.tab_view.add("📊 Tricount Balance Sheets")
+        cursor.execute("SELECT COUNT(*) FROM expenses")
+        current_idx = cursor.fetchone()[0]
+        color = random.choice(["#3A7EBB", "#2E9A67", "#D9534F", "#F0AD4E", "#9B59B6"])
         
-        # Scrollable View Containers
-        self.scroll_roster = ctk.CTkScrollableFrame(self.tab_view.tab("👥 Group Roster"))
-        self.scroll_roster.pack(fill="both", expand=True)
+        try:
+            cursor.execute("INSERT INTO users (name, color, joined_index, is_contributor) VALUES (?, ?, ?, 0)", (name, color, current_idx))
+            conn.commit()
+            self.ent_new_user.delete(0, "end")
+        except sqlite3.IntegrityError:
+            messagebox.showwarning("Error", "User name already exists inside the ledger database.")
+        conn.close()
+        self.refresh_all_data()
+
+    def log_deposit_action(self):
+        try:
+            amt = float(self.ent_dep_amt.get().strip())
+            payer = self.combo_dep_payer.get()
+            if amt <= 0 or not payer: raise ValueError
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO expenses (description, amount, paid_by, participants, is_deposit) VALUES (?, ?, ?, '', 1)",
+                           (f"Deposit into Wallet by {payer}", amt, payer))
+            conn.commit()
+            conn.close()
+            self.ent_dep_amt.delete(0, "end")
+            self.refresh_all_data()
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Provide a valid positive money amount value.")
+
+    def log_expense_action(self):
+        try:
+            desc = self.ent_exp_desc.get().strip()
+            amt = float(self.ent_exp_amt.get().strip())
+            payer = self.combo_exp_payer.get()
+            if amt <= 0 or not desc or not payer: raise ValueError
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM expenses")
+            cur_idx = cursor.fetchone()[0]
+            cursor.execute("SELECT name FROM users WHERE joined_index <= ?", (cur_idx,))
+            allowed = [r[0] for r in cursor.fetchall()]
+            
+            cursor.execute("INSERT INTO expenses (description, amount, paid_by, participants, is_deposit) VALUES (?, ?, ?, ?, 0)",
+                           (desc, amt, payer, ";".join(allowed)))
+            conn.commit()
+            conn.close()
+            
+            self.ent_exp_desc.delete(0, "end")
+            self.ent_exp_amt.delete(0, "end")
+            self.refresh_all_data()
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Check fields and ensure pricing amounts are positive.")
+
+    def toggle_contributor(self, name):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_contributor FROM users WHERE name = ?", (name,))
+        current = cursor.fetchone()[0]
+        cursor.execute("UPDATE users SET is_contributor = ? WHERE name = ?", (1 if current == 0 else 0, name))
+        conn.commit()
+        conn.close()
+        self.refresh_all_data()
+
+    def kick_user(self, name):
+        if messagebox.askyesno("Confirm Kick", f"Permanently remove {name} and clear their payments?"):
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM users WHERE name = ?", (name,))
+            cursor.execute("DELETE FROM expenses WHERE paid_by = ?", (name,))
+            conn.commit()
+            conn.close()
+            self.refresh_all_data()
+
+    def delete_expense(self, e_id):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM expenses WHERE id = ?", (e_id,))
+        conn.commit()
+        conn.close()
+        self.refresh_all_data()
+
+    def modify_expense_popup(self, exp):
+        popup = ctk.CTkToplevel(self)
+        popup.title("Modify Transaction")
+        popup.geometry("350x250")
+        popup.resizable(False, False)
         
-        self.scroll_history = ctk.CTkScrollableFrame(self.tab_view.tab("📜 History Logs"))
-        self.scroll_history.pack(fill="both", expand=True)
+        ctk.CTkLabel(popup, text="Update Description:").pack(pady=5)
+        e_desc = ctk.CTkEntry(popup, width=250)
+        e_desc.insert(0, exp["desc"])
+        e_desc.pack()
         
-        # Text block output for calculation matrices
-        self.txt_tricount = ctk.CTkTextbox(self.tab_view.tab("📊 Tricount Balance Sheets"), font=("Courier New", 12))
-        self.txt_tricount.pack(fill="both", expand=True, padx=10, pady=10)
+        ctk.CTkLabel(popup, text="Update Amount:").pack(pady=5)
+        e_amt = ctk.CTkEntry(popup, width=250)
+        e_amt.insert(0, f"{exp['amount']:.2f}")
+        e_amt.pack()
+        
+        def save_changes():
+            try:
+                new_desc = e_desc.get().strip()
+                new_amt = float(e_amt.get().strip())
+                if new_amt <= 0 or not new_desc: raise ValueError
+                
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("UPDATE expenses SET description = ?, amount = ? WHERE id = ?", (new_desc, new_amt, exp["id"]))
+                conn.commit()
+                conn.close()
+                popup.destroy()
+                self.refresh_all_data()
+            except ValueError:
+                messagebox.showerror("Error", "Invalid field validation configurations.")
+
+        ctk.CTkButton(popup, text="Save Changes", command=save_changes).pack(pady=20)
+
+    # ---- Graph Rendering Logic ----
+    def on_tab_change(self):
+        if self.tab_view.get() == "📈 Trends":
+            self.render_graph()
+
+    def render_graph(self):
+        for widget in self.graph_frame.winfo_children():
+            widget.destroy()
+            
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT amount, is_deposit FROM expenses ORDER BY id ASC")
+            data = cur.fetchall()
+            conn.close()
+
+            fig, ax = plt.subplots(figsize=(5, 3), dpi=100)
+            fig.patch.set_facecolor('#2b2b2b')
+            ax.set_facecolor('#2b2b2b')
+            
+            balances = [0]
+            curr = 0
+            for amt, is_dep in data:
+                curr += amt if is_dep == 1 else -amt
+                balances.append(curr)
+                
+            ax.plot(balances, color='#2E9A67', marker='o', linewidth=2)
+            ax.tick_params(colors='white')
+            ax.spines['bottom'].set_color('white')
+            ax.spines['left'].set_color('white')
+            
+            canvas = FigureCanvasTkAgg(fig, master=self.graph_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+            
+            # Prevent memory leaks by properly closing the plot
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"Error rendering graph: {e}")
 
     # ---- Data Processing Logic Engine ----
     def refresh_all_data(self):
@@ -356,141 +527,18 @@ class TrackerDashboard(ctk.CTk):
         self.txt_tricount.delete("1.0", "end")
         self.txt_tricount.insert("1.0", display_text)
         self.txt_tricount.configure(state="disabled")
-
-    # ---- Actions Mechanics Callbacks ----
-    def add_user_action(self):
-        name = self.ent_new_user.get().strip()
-        if not name or name.upper() == "[WALLET]": return
-        conn = get_db_connection()
-        cursor = conn.cursor()
         
-        cursor.execute("SELECT COUNT(*) FROM expenses")
-        current_idx = cursor.fetchone()[0]
-        color = random.choice(["#3A7EBB", "#2E9A67", "#D9534F", "#F0AD4E", "#9B59B6"])
-        
-        try:
-            cursor.execute("INSERT INTO users (name, color, joined_index, is_contributor) VALUES (?, ?, ?, 0)", (name, color, current_idx))
-            conn.commit()
-            self.ent_new_user.delete(0, "end")
-        except sqlite3.IntegrityError:
-            messagebox.showwarning("Error", "User name already exists inside the ledger database.")
-        conn.close()
-        self.refresh_all_data()
-
-    def log_deposit_action(self):
-        try:
-            amt = float(self.ent_dep_amt.get().strip())
-            payer = self.combo_dep_payer.get()
-            if amt <= 0 or not payer: raise ValueError
-            
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO expenses (description, amount, paid_by, participants, is_deposit) VALUES (?, ?, ?, '', 1)",
-                           (f"Deposit into Wallet by {payer}", amt, payer))
-            conn.commit()
-            conn.close()
-            self.ent_dep_amt.delete(0, "end")
-            self.refresh_all_data()
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Provide a valid positive money amount value.")
-
-    def log_expense_action(self):
-        try:
-            desc = self.ent_exp_desc.get().strip()
-            amt = float(self.ent_exp_amt.get().strip())
-            payer = self.combo_exp_payer.get()
-            if amt <= 0 or not desc or not payer: raise ValueError
-            
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            
-            # Auto calculate current list of targeted splitting members
-            cursor.execute("SELECT COUNT(*) FROM expenses")
-            cur_idx = cursor.fetchone()[0]
-            cursor.execute("SELECT name FROM users WHERE joined_index <= ?", (cur_idx,))
-            allowed = [r[0] for r in cursor.fetchall()]
-            
-            cursor.execute("INSERT INTO expenses (description, amount, paid_by, participants, is_deposit) VALUES (?, ?, ?, ?, 0)",
-                           (desc, amt, payer, ";".join(allowed)))
-            conn.commit()
-            conn.close()
-            
-            self.ent_exp_desc.delete(0, "end")
-            self.ent_exp_amt.delete(0, "end")
-            self.refresh_all_data()
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Check fields and ensure pricing amounts are positive.")
-
-    def toggle_contributor(self, name):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT is_contributor FROM users WHERE name = ?", (name,))
-        current = cursor.fetchone()[0]
-        cursor.execute("UPDATE users SET is_contributor = ? WHERE name = ?", (1 if current == 0 else 0, name))
-        conn.commit()
-        conn.close()
-
-    def kick_user(self, name):
-        if messagebox.askyesno("Confirm Kick", f"Permanently remove {name} and clear their payments?"):
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM users WHERE name = ?", (name,))
-            cursor.execute("DELETE FROM expenses WHERE paid_by = ?", (name,))
-            conn.commit()
-            conn.close()
-            self.refresh_all_data()
-
-    def delete_expense(self, e_id):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM expenses WHERE id = ?", (e_id,))
-        conn.commit()
-        conn.close()
-        self.refresh_all_data()
-
-    def modify_expense_popup(self, exp):
-        popup = ctk.CTkToplevel(self)
-        popup.title("Modify Transaction")
-        popup.geometry("350x250")
-        popup.resizable(False, False)
-        
-        ctk.CTkLabel(popup, text="Update Description:").pack(pady=5)
-        e_desc = ctk.CTkEntry(popup, width=250)
-        e_desc.insert(0, exp["desc"])
-        e_desc.pack()
-        
-        ctk.CTkLabel(popup, text="Update Amount:").pack(pady=5)
-        e_amt = ctk.CTkEntry(popup, width=250)
-        e_amt.insert(0, f"{exp['amount']:.2f}")
-        e_amt.pack()
-        
-        def save_changes():
-            try:
-                new_desc = e_desc.get().strip()
-                new_amt = float(e_amt.get().strip())
-                if new_amt <= 0 or not new_desc: raise ValueError
-                
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute("UPDATE expenses SET description = ?, amount = ? WHERE id = ?", (new_desc, new_amt, exp["id"]))
-                conn.commit()
-                conn.close()
-                popup.destroy()
-                self.refresh_all_data()
-            except ValueError:
-                messagebox.showerror("Error", "Invalid field validation configurations.")
-
-        ctk.CTkButton(popup, text="Save Changes", command=save_changes).pack(pady=20)
+        # Always update the graph if its tab is currently open during a refresh
+        if self.tab_view.get() == "📈 Trends":
+            self.render_graph()
 
 # =========================================================
 # 🚀 CORE SYSTEM LAUNCH EXECUTION SEQUENCER
 # =========================================================
 if __name__ == "__main__":
-    # Step 1: Open the dark password prompt gate window safely
     gate = LoginWindow()
     gate.mainloop()
     
-    # Step 2: If the password check resolved successfully, boot the workspace layout
     if gate.authenticated:
         app = TrackerDashboard(role=gate.user_role)
         app.mainloop()
